@@ -44,9 +44,8 @@ func WithSink(output io.Writer, formatter Formatter) LoggerOption {
 	if formatter == nil {
 		formatter = &TextFormatter{}
 	}
-	ws := NewWriterSink(output, formatter)
 	return func(cfg *LoggerConfig) {
-		cfg.Sinks = append(cfg.Sinks, ws)
+		cfg.Sinks = append(cfg.Sinks, NewWriterSink(output, formatter))
 	}
 }
 
@@ -66,7 +65,7 @@ func WithFileSink(path string, formatter Formatter) LoggerOption {
 	}
 }
 
-func (l *loggerImpl) WithCtx(ctx context.Context, fields ...Field) {
+func (l *loggerImpl) WithCtx(ctx context.Context, fields ...models.Field) {
 	ctx = l.with(ctx, fields...)
 	l.ctx = ctx
 }
@@ -78,39 +77,47 @@ func (l *loggerImpl) RemoveFromCtx(ctx context.Context, keys ...string) {
 
 	cData := getCtxData(ctx)
 	for _, k := range keys {
-		delete(cData.fields, k)
+		for i, f := range cData.fields {
+			if f.Key == k {
+				cData.fields = append(cData.fields[:i], cData.fields[i+1:]...)
+				break
+			}
+		}
 	}
 
 	l.ctx = context.WithValue(ctx, ctxKey{}, cData)
 }
 
-type Field struct {
-	Key   string
-	Value interface{}
+func String(key, value string) models.Field {
+	return models.Field{Key: key, Value: value}
 }
 
-func String(key, value string) Field {
-	return Field{Key: key, Value: value}
+func Int(key string, value int) models.Field {
+	return models.Field{Key: key, Value: value}
 }
 
-func Int(key string, value int) Field {
-	return Field{Key: key, Value: value}
-}
-
-func Any(key string, value interface{}) Field {
-	return Field{Key: key, Value: value}
+func Any(key string, value interface{}) models.Field {
+	return models.Field{Key: key, Value: value}
 }
 
 type ctxKey struct{}
 
 type ctxData struct {
-	fields map[string]interface{}
+	fields []models.Field
+}
+
+var fieldsSlicePool = sync.Pool{
+	New: func() interface{} {
+		return make([]models.Field, 0, 5)
+	},
 }
 
 func getCtxData(ctx context.Context) *ctxData {
 	data, ok := ctx.Value(ctxKey{}).(*ctxData)
 	if !ok || data == nil {
-		return &ctxData{fields: make(map[string]interface{})}
+		return &ctxData{
+			fields: fieldsSlicePool.Get().([]models.Field)[:0],
+		}
 	}
 	return data
 }
@@ -137,7 +144,7 @@ func NewWriterSink(output io.Writer, formatter Formatter) *WriterSink {
 }
 
 func defaultFormatter() Formatter {
-	return &TextFormatter{}
+	return &JSONFormatter{}
 }
 
 func (ws *WriterSink) Write(record models.LogRecord) error {
@@ -151,14 +158,14 @@ func (ws *WriterSink) Write(record models.LogRecord) error {
 }
 
 type Logger interface {
-	Debug(msg string, fields ...Field)
-	Info(msg string, fields ...Field)
-	Warn(msg string, fields ...Field)
-	Error(msg string, fields ...Field)
-	Fatal(msg string, fields ...Field)
-	Panic(msg string, fields ...Field)
+	Debug(msg string, fields ...models.Field)
+	Info(msg string, fields ...models.Field)
+	Warn(msg string, fields ...models.Field)
+	Error(msg string, fields ...models.Field)
+	Fatal(msg string, fields ...models.Field)
+	Panic(msg string, fields ...models.Field)
 
-	WithCtx(ctx context.Context, fields ...Field)
+	WithCtx(ctx context.Context, fields ...models.Field)
 	RemoveFromCtx(ctx context.Context, keys ...string)
 	Close()
 }
@@ -174,33 +181,33 @@ type loggerImpl struct {
 	ctx       context.Context
 }
 
-func (l *loggerImpl) Debug(msg string, fields ...Field) {
+func (l *loggerImpl) Debug(msg string, fields ...models.Field) {
 	l.log(models.LevelDebug, msg, fields...)
 }
 
-func (l *loggerImpl) Info(msg string, fields ...Field) {
+func (l *loggerImpl) Info(msg string, fields ...models.Field) {
 	l.log(models.LevelInfo, msg, fields...)
 }
 
-func (l *loggerImpl) Warn(msg string, fields ...Field) {
+func (l *loggerImpl) Warn(msg string, fields ...models.Field) {
 	l.log(models.LevelWarn, msg, fields...)
 }
 
-func (l *loggerImpl) Error(msg string, fields ...Field) {
+func (l *loggerImpl) Error(msg string, fields ...models.Field) {
 	l.log(models.LevelError, msg, fields...)
 }
 
-func (l *loggerImpl) Fatal(msg string, fields ...Field) {
+func (l *loggerImpl) Fatal(msg string, fields ...models.Field) {
 	l.log(models.LevelFatal, msg, fields...)
 	os.Exit(1)
 }
 
-func (l *loggerImpl) Panic(msg string, fields ...Field) {
+func (l *loggerImpl) Panic(msg string, fields ...models.Field) {
 	l.log(models.LevelPanic, msg, fields...)
 	panic(msg)
 }
 
-func (l *loggerImpl) log(level models.Level, msg string, fields ...Field) {
+func (l *loggerImpl) log(level models.Level, msg string, fields ...models.Field) {
 	if level < l.level {
 		return
 	}
@@ -216,22 +223,20 @@ func (l *loggerImpl) log(level models.Level, msg string, fields ...Field) {
 
 	// Acquire from pool
 	record := pool.AcquireLogRecord()
-
 	record.Timestamp = time.Now()
 	record.Level = level
 	record.Message = msg
 
-	var ctx context.Context
-	if l.ctx != nil {
-		ctx = l.ctx
-	} else {
-		ctx = context.Background()
-	}
+	// var ctx context.Context
+	// if l.ctx != nil {
+	// 	ctx = l.ctx
+	// } else {
+	// 	ctx = context.Background()
+	// }
 
-	mergedFields := mergeFields(ctx, fields)
-	for k, v := range mergedFields {
-		record.Fields[k] = v
-	}
+	mergedFields := mergeFields(l.ctx, fields)
+	record.Fields = record.Fields[:0]
+	record.Fields = append(record.Fields, mergedFields...)
 
 	// If async is enabled, enqueue
 	if l.async {
@@ -239,7 +244,7 @@ func (l *loggerImpl) log(level models.Level, msg string, fields ...Field) {
 		case l.asyncChan <- record:
 		default:
 			// queue is full, drop the record
-			// dropping is not ideal, but blocking could lead to deadlocks
+			// dropping is not ideal, but blocking could lead to deadlocks, will review TODO
 		}
 		return
 	}
@@ -258,40 +263,35 @@ func (l *loggerImpl) log(level models.Level, msg string, fields ...Field) {
 	pool.ReleaseLogRecord(record)
 }
 
-func (l *loggerImpl) with(ctx context.Context, fields ...Field) context.Context {
+func (l *loggerImpl) with(ctx context.Context, fields ...models.Field) context.Context {
 	if len(fields) == 0 {
 		return ctx
 	}
 
 	existingData := getCtxData(ctx)
 	newData := &ctxData{
-		fields: make(map[string]interface{}, len(existingData.fields)+len(fields)),
+		fields: make([]models.Field, 0, 5),
 	}
 
 	// Copy existing fields
-	for k, v := range existingData.fields {
-		newData.fields[k] = v
-	}
+	copy(newData.fields, existingData.fields)
 
 	// Add new fields
-	for _, f := range fields {
-		newData.fields[f.Key] = f.Value
-	}
+	newData.fields = append(newData.fields, fields...)
 
 	// Return a new context with updated data
 	return context.WithValue(ctx, ctxKey{}, newData)
 }
 
-func mergeFields(ctx context.Context, extra []Field) map[string]interface{} {
-	cData := getCtxData(ctx)
-	merged := make(map[string]interface{}, len(cData.fields)+len(extra))
-	for k, v := range cData.fields {
-		merged[k] = v
+func mergeFields(ctx context.Context, extra []models.Field) []models.Field {
+	if ctx == nil {
+		return extra
 	}
 
-	for _, f := range extra {
-		merged[f.Key] = f.Value
-	}
+	cData := getCtxData(ctx)
+	merged := make([]models.Field, 0, len(cData.fields)+len(extra))
+	merged = append(merged, cData.fields...)
+	merged = append(merged, extra...)
 	return merged
 }
 
