@@ -18,6 +18,7 @@ type LoggerConfig struct {
 	Sinks           []Sink
 	AutoRotate      bool // TODO: handle log rotation
 	RotateSize      int64
+	dropOnFull      bool
 }
 
 type LoggerOption func(*LoggerConfig)
@@ -45,7 +46,19 @@ func WithSink(output io.Writer, formatter Formatter) LoggerOption {
 		formatter = &TextFormatter{}
 	}
 	return func(cfg *LoggerConfig) {
-		cfg.Sinks = append(cfg.Sinks, NewWriterSink(output, formatter))
+		cfg.Sinks = append(cfg.Sinks, newWriterSink(output, formatter))
+	}
+}
+
+func WithAsyncDropPolicy() LoggerOption {
+	return func(cfg *LoggerConfig) {
+		cfg.dropOnFull = true
+	}
+}
+
+func WithAsyncBlockPolicy() LoggerOption {
+	return func(cfg *LoggerConfig) {
+		cfg.dropOnFull = false
 	}
 }
 
@@ -59,13 +72,13 @@ func WithFileSink(path string, formatter Formatter) LoggerOption {
 		return func(cfg *LoggerConfig) {}
 	}
 
-	ws := NewWriterSink(file, formatter)
+	ws := newWriterSink(file, formatter)
 	return func(cfg *LoggerConfig) {
 		cfg.Sinks = append(cfg.Sinks, ws)
 	}
 }
 
-func (l *loggerImpl) WithCtx(ctx context.Context, fields ...models.Field) {
+func (l *loggerImpl) WithCtx(ctx context.Context, fields ...*models.Field) {
 	ctx = l.with(ctx, fields...)
 	l.ctx = ctx
 }
@@ -88,27 +101,31 @@ func (l *loggerImpl) RemoveFromCtx(ctx context.Context, keys ...string) {
 	l.ctx = context.WithValue(ctx, ctxKey{}, cData)
 }
 
-func String(key, value string) models.Field {
-	return models.Field{Key: key, Value: value}
+func String(key, value string) *models.Field {
+	f := pool.AcquireFieldKV(key, value)
+	return f
 }
 
-func Int(key string, value int) models.Field {
-	return models.Field{Key: key, Value: value}
+func Int(key string, value int) *models.Field {
+	f := pool.AcquireFieldKV(key, value)
+	return f
 }
 
-func Any(key string, value interface{}) models.Field {
-	return models.Field{Key: key, Value: value}
+func Any(key string, value interface{}) *models.Field {
+	f := pool.AcquireFieldKV(key, value)
+	return f
 }
 
 type ctxKey struct{}
 
 type ctxData struct {
-	fields []models.Field
+	fields []*models.Field
 }
 
 var fieldsSlicePool = sync.Pool{
 	New: func() interface{} {
-		return make([]models.Field, 0, 5)
+		s := make([]*models.Field, 0, 5)
+		return &s
 	},
 }
 
@@ -116,7 +133,7 @@ func getCtxData(ctx context.Context) *ctxData {
 	data, ok := ctx.Value(ctxKey{}).(*ctxData)
 	if !ok || data == nil {
 		return &ctxData{
-			fields: fieldsSlicePool.Get().([]models.Field)[:0],
+			fields: make([]*models.Field, 0, 5), // TODO: review this initial capacity of 5
 		}
 	}
 	return data
@@ -133,7 +150,7 @@ type WriterSink struct {
 	formatter Formatter
 }
 
-func NewWriterSink(output io.Writer, formatter Formatter) *WriterSink {
+func newWriterSink(output io.Writer, formatter Formatter) *WriterSink {
 	if formatter == nil {
 		formatter = defaultFormatter()
 	}
@@ -158,56 +175,57 @@ func (ws *WriterSink) Write(record models.LogRecord) error {
 }
 
 type Logger interface {
-	Debug(msg string, fields ...models.Field)
-	Info(msg string, fields ...models.Field)
-	Warn(msg string, fields ...models.Field)
-	Error(msg string, fields ...models.Field)
-	Fatal(msg string, fields ...models.Field)
-	Panic(msg string, fields ...models.Field)
+	Debug(msg string, fields ...*models.Field)
+	Info(msg string, fields ...*models.Field)
+	Warn(msg string, fields ...*models.Field)
+	Error(msg string, fields ...*models.Field)
+	Fatal(msg string, fields ...*models.Field)
+	Panic(msg string, fields ...*models.Field)
 
-	WithCtx(ctx context.Context, fields ...models.Field)
+	WithCtx(ctx context.Context, fields ...*models.Field)
 	RemoveFromCtx(ctx context.Context, keys ...string)
 	Close()
 }
 
 type loggerImpl struct {
-	level     models.Level
-	sinks     []Sink
-	mu        sync.Mutex
-	asyncChan chan *models.LogRecord
-	wg        sync.WaitGroup
-	async     bool
-	sampler   Sampler
-	ctx       context.Context
+	level      models.Level
+	sinks      []Sink
+	mu         sync.Mutex
+	asyncChan  chan *models.LogRecord
+	wg         sync.WaitGroup
+	async      bool
+	sampler    Sampler
+	ctx        context.Context
+	dropOnFull bool
 }
 
-func (l *loggerImpl) Debug(msg string, fields ...models.Field) {
+func (l *loggerImpl) Debug(msg string, fields ...*models.Field) {
 	l.log(models.LevelDebug, msg, fields...)
 }
 
-func (l *loggerImpl) Info(msg string, fields ...models.Field) {
+func (l *loggerImpl) Info(msg string, fields ...*models.Field) {
 	l.log(models.LevelInfo, msg, fields...)
 }
 
-func (l *loggerImpl) Warn(msg string, fields ...models.Field) {
+func (l *loggerImpl) Warn(msg string, fields ...*models.Field) {
 	l.log(models.LevelWarn, msg, fields...)
 }
 
-func (l *loggerImpl) Error(msg string, fields ...models.Field) {
+func (l *loggerImpl) Error(msg string, fields ...*models.Field) {
 	l.log(models.LevelError, msg, fields...)
 }
 
-func (l *loggerImpl) Fatal(msg string, fields ...models.Field) {
+func (l *loggerImpl) Fatal(msg string, fields ...*models.Field) {
 	l.log(models.LevelFatal, msg, fields...)
 	os.Exit(1)
 }
 
-func (l *loggerImpl) Panic(msg string, fields ...models.Field) {
+func (l *loggerImpl) Panic(msg string, fields ...*models.Field) {
 	l.log(models.LevelPanic, msg, fields...)
 	panic(msg)
 }
 
-func (l *loggerImpl) log(level models.Level, msg string, fields ...models.Field) {
+func (l *loggerImpl) log(level models.Level, msg string, fields ...*models.Field) {
 	if level < l.level {
 		return
 	}
@@ -221,30 +239,31 @@ func (l *loggerImpl) log(level models.Level, msg string, fields ...models.Field)
 		return
 	}
 
-	// Acquire from pool
 	record := pool.AcquireLogRecord()
 	record.Timestamp = time.Now()
 	record.Level = level
 	record.Message = msg
 
-	// var ctx context.Context
-	// if l.ctx != nil {
-	// 	ctx = l.ctx
-	// } else {
-	// 	ctx = context.Background()
-	// }
-
-	mergedFields := mergeFields(l.ctx, fields)
+	merged := mergeFields(l.ctx, fields)
 	record.Fields = record.Fields[:0]
-	record.Fields = append(record.Fields, mergedFields...)
+	for _, f := range merged {
+		pooledF := pool.AcquireFieldKV(f.Key, f.Value)
+		record.Fields = append(record.Fields, pooledF)
+	}
+	releaseMergedFields(merged)
 
 	// If async is enabled, enqueue
 	if l.async {
 		select {
 		case l.asyncChan <- record:
 		default:
-			// queue is full, drop the record
-			// dropping is not ideal, but blocking could lead to deadlocks, will review TODO
+			if l.dropOnFull {
+				pool.ReleaseLogRecord(record)
+				return
+			} else {
+				// block until there is space in the channel
+				l.asyncChan <- record
+			}
 		}
 		return
 	}
@@ -263,36 +282,36 @@ func (l *loggerImpl) log(level models.Level, msg string, fields ...models.Field)
 	pool.ReleaseLogRecord(record)
 }
 
-func (l *loggerImpl) with(ctx context.Context, fields ...models.Field) context.Context {
+func (l *loggerImpl) with(ctx context.Context, fields ...*models.Field) context.Context {
 	if len(fields) == 0 {
 		return ctx
 	}
 
 	existingData := getCtxData(ctx)
 	newData := &ctxData{
-		fields: make([]models.Field, 0, 5),
+		fields: make([]*models.Field, len(existingData.fields), len(existingData.fields)+len(fields)),
 	}
 
-	// Copy existing fields
 	copy(newData.fields, existingData.fields)
-
-	// Add new fields
 	newData.fields = append(newData.fields, fields...)
-
-	// Return a new context with updated data
 	return context.WithValue(ctx, ctxKey{}, newData)
 }
 
-func mergeFields(ctx context.Context, extra []models.Field) []models.Field {
+func mergeFields(ctx context.Context, extra []*models.Field) []*models.Field {
 	if ctx == nil {
 		return extra
 	}
 
 	cData := getCtxData(ctx)
-	merged := make([]models.Field, 0, len(cData.fields)+len(extra))
+	merged := (*fieldsSlicePool.Get().(*[]*models.Field))[:0]
 	merged = append(merged, cData.fields...)
 	merged = append(merged, extra...)
 	return merged
+}
+
+func releaseMergedFields(fields []*models.Field) {
+	fields = fields[:0]
+	fieldsSlicePool.Put(&fields)
 }
 
 func New(options ...LoggerOption) Logger {
@@ -305,36 +324,38 @@ func New(options ...LoggerOption) Logger {
 
 	// If no sinks provided, log to console
 	if len(cfg.Sinks) == 0 {
-		cfg.Sinks = append(cfg.Sinks, NewWriterSink(os.Stdout, &TextFormatter{}))
+		cfg.Sinks = append(cfg.Sinks, newWriterSink(os.Stdout, &TextFormatter{}))
 	}
 
 	l := &loggerImpl{
-		level:   cfg.Level,
-		sinks:   cfg.Sinks,
-		sampler: cfg.Sampler,
+		level:      cfg.Level,
+		sinks:      cfg.Sinks,
+		sampler:    cfg.Sampler,
+		dropOnFull: cfg.dropOnFull,
 	}
 
 	// If async, start a goroutine to handle log records
 	if cfg.AsyncBufferSize > 0 {
 		l.async = true
 		l.asyncChan = make(chan *models.LogRecord, cfg.AsyncBufferSize)
-		l.wg.Add(1)
-		go func() {
-			defer l.wg.Done()
-			for record := range l.asyncChan {
-				// Write record to each sink
-				for _, sink := range l.sinks {
-					_ = sink.Write(*record) // TODO: handle error
-					// if err != nil {
-					// 	handleAsynWriteError(sink, record)
-					// }
-				}
-				pool.ReleaseLogRecord(record)
-			}
-		}()
+		numWorkers := 1 //runtime.NumCPU()
+		for i := 0; i < numWorkers; i++ {
+			l.wg.Add(1)
+			go l.asyncWorker()
+		}
 	}
 
 	return l
+}
+
+func (l *loggerImpl) asyncWorker() {
+	defer l.wg.Done()
+	for record := range l.asyncChan {
+		for _, sink := range l.sinks {
+			_ = sink.Write(*record) // TODO: handle error
+		}
+		pool.ReleaseLogRecord(record)
+	}
 }
 
 func (l *loggerImpl) Close() {

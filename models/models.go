@@ -1,5 +1,7 @@
 package models
 
+import "time"
+
 type Level int8
 
 const (
@@ -22,4 +24,16 @@ var levelsMap = map[Level]string{
 
 func (l *Level) ToStr() string {
 	return levelsMap[*l]
+}
+
+type Field struct {
+	Key   string
+	Value interface{}
+}
+
+type LogRecord struct {
+	Timestamp time.Time
+	Level     Level
+	Message   string
+	Fields    []*Field
 }

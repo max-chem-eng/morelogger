@@ -1,10 +1,12 @@
 package morelogger
 
 import (
+	"bytes"
 	"fmt"
+	"io"
+	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/max-chem-eng/morelogger/models"
 )
@@ -14,48 +16,53 @@ type Formatter interface {
 }
 
 type JSONFormatter struct {
-	Indent bool
-	// escapeHTML           bool
-	// overrideRepeatedKeys bool
+	bufPool sync.Pool
 }
 
-// Format implements Formatter for JSON output.
+var byteBufferPool = sync.Pool{
+	New: func() interface{} { return new(bytes.Buffer) },
+}
+
+func NewJSONFormatter() *JSONFormatter {
+	return &JSONFormatter{
+		bufPool: sync.Pool{
+			New: func() interface{} {
+				return new(bytes.Buffer)
+			},
+		},
+	}
+}
+
 func (jf *JSONFormatter) Format(record models.LogRecord) ([]byte, error) {
-	sb := stringBuilderPool.Get().(*strings.Builder)
-	sb.Reset()
-	defer stringBuilderPool.Put(sb)
+	buf := jf.bufPool.Get().(*bytes.Buffer)
+	defer jf.bufPool.Put(buf)
+	buf.Reset()
 
-	sb.WriteString("{")
+	buf.WriteByte('{')
+	buf.WriteString(`"timestamp":"`)
+	buf.WriteString(record.Timestamp.Format(TimeFormat))
+	buf.WriteString(`",`)
 
-	// Timestamp
-	sb.WriteString(`"timestamp":"`)
-	sb.WriteString(record.Timestamp.Format(time.RFC3339))
-	sb.WriteString(`",`)
+	buf.WriteString(`"level":"`)
+	buf.WriteString(record.Level.ToStr())
+	buf.WriteString(`",`)
 
-	// Level
-	sb.WriteString(`"level":"`)
-	sb.WriteString(record.Level.ToStr())
-	sb.WriteString(`",`)
+	buf.WriteString(`"message":`)
+	encodeString(buf, record.Message)
 
-	// Message
-	sb.WriteString(`"message":`)
-	encodeString(sb, record.Message)
-	sb.WriteString(`,`)
-
-	// Fields
-	// sb.WriteString(`"fields":{`)
+	buf.WriteByte(',')
 	for i, f := range record.Fields {
-		sb.WriteString(`"`)
-		sb.WriteString(f.Key)
-		sb.WriteString(`":`)
-		encodeValue(sb, f.Value)
+		buf.WriteByte('"')
+		buf.WriteString(f.Key)
+		buf.WriteString(`":`)
+		encodeValue(buf, f.Value)
 		if i < len(record.Fields)-1 {
-			sb.WriteString(",")
+			buf.WriteByte(',')
 		}
 	}
-	// sb.WriteString("}}")
+	buf.WriteByte('}')
 
-	return []byte(sb.String()), nil
+	return buf.Bytes(), nil
 }
 
 type TextFormatter struct {
@@ -116,34 +123,36 @@ func resetColor() string {
 	return "\033[0m"
 }
 
-func encodeString(sb *strings.Builder, s string) {
-	sb.WriteByte('"')
-	for i := 0; i < len(s); i++ {
-		switch c := s[i]; c {
-		case '\\', '"':
-			sb.WriteByte('\\')
-			sb.WriteByte(c)
-		case '\n':
-			sb.WriteString("\\n")
-		case '\r':
-			sb.WriteString("\\r")
-		case '\t':
-			sb.WriteString("\\t")
-		default:
-			sb.WriteByte(c)
-		}
-	}
-	sb.WriteByte('"')
+func encodeString(w io.Writer, s string) {
+	buf := byteBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	buf.Write(strconv.AppendQuote(buf.Bytes(), s))
+	w.Write(buf.Bytes())
+	byteBufferPool.Put(buf)
 }
 
-func encodeValue(sb *strings.Builder, v interface{}) {
-	switch val := v.(type) {
+// formatters.go
+func encodeValue(w io.Writer, val interface{}) {
+	switch v := val.(type) {
 	case string:
-		encodeString(sb, val)
-	case int, int32, int64, float32, float64, bool:
-		fmt.Fprint(sb, val)
+		encodeString(w, v)
+	case int:
+		w.Write([]byte(strconv.Itoa(v)))
+	case int32:
+		w.Write([]byte(strconv.FormatInt(int64(v), 10)))
+	case int64:
+		w.Write([]byte(strconv.FormatInt(v, 10)))
+	case float32:
+		w.Write([]byte(strconv.FormatFloat(float64(v), 'f', -1, 32)))
+	case float64:
+		w.Write([]byte(strconv.FormatFloat(v, 'f', -1, 64)))
+	case bool:
+		if v {
+			w.Write([]byte("true"))
+		} else {
+			w.Write([]byte("false"))
+		}
 	default:
-		// fallback if needed
-		encodeString(sb, fmt.Sprintf("%v", val))
+		encodeString(w, fmt.Sprintf("%v", v))
 	}
 }
