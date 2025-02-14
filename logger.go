@@ -43,7 +43,7 @@ func WithSampling(sampler Sampler) LoggerOption {
 
 func WithSink(output io.Writer, formatter Formatter) LoggerOption {
 	if formatter == nil {
-		formatter = &TextFormatter{}
+		formatter = &JSONFormatter{}
 	}
 	return func(cfg *LoggerConfig) {
 		cfg.Sinks = append(cfg.Sinks, newWriterSink(output, formatter))
@@ -64,7 +64,7 @@ func WithAsyncBlockPolicy() LoggerOption {
 
 func WithFileSink(path string, formatter Formatter) LoggerOption {
 	if formatter == nil {
-		formatter = &TextFormatter{}
+		formatter = &JSONFormatter{}
 	}
 
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
@@ -124,7 +124,7 @@ type ctxData struct {
 
 var fieldsSlicePool = sync.Pool{
 	New: func() interface{} {
-		s := make([]*models.Field, 0, 5)
+		s := make([]*models.Field, 0, 3)
 		return &s
 	},
 }
@@ -133,7 +133,7 @@ func getCtxData(ctx context.Context) *ctxData {
 	data, ok := ctx.Value(ctxKey{}).(*ctxData)
 	if !ok || data == nil {
 		return &ctxData{
-			fields: make([]*models.Field, 0, 5), // TODO: review this initial capacity of 5
+			fields: make([]*models.Field, 0, 3), // TODO: review this initial capacity of 5
 		}
 	}
 	return data
@@ -158,10 +158,6 @@ func newWriterSink(output io.Writer, formatter Formatter) *WriterSink {
 		output:    output,
 		formatter: formatter,
 	}
-}
-
-func defaultFormatter() Formatter {
-	return &JSONFormatter{}
 }
 
 func (ws *WriterSink) Write(record models.LogRecord) error {
@@ -314,18 +310,20 @@ func releaseMergedFields(fields []*models.Field) {
 	fieldsSlicePool.Put(&fields)
 }
 
-func New(options ...LoggerOption) Logger {
-	cfg := &LoggerConfig{
-		Level: models.LevelInfo,
-	}
-	for _, opt := range options {
-		opt(cfg)
-	}
+func New(cfg LoggerConfig) Logger {
+	// cfg := &LoggerConfig{
+	// 	Level: defaultLevel(),
+	// }
+	// for _, opt := range options {
+	// 	opt(cfg)
+	// }
 
 	// If no sinks provided, log to console
 	if len(cfg.Sinks) == 0 {
-		cfg.Sinks = append(cfg.Sinks, newWriterSink(os.Stdout, &TextFormatter{}))
+		cfg.Sinks = append(cfg.Sinks, newWriterSink(os.Stdout, &JSONFormatter{}))
 	}
+
+	// cfg := buildCfgFromOptions(options...)
 
 	l := &loggerImpl{
 		level:      cfg.Level,
@@ -346,6 +344,22 @@ func New(options ...LoggerOption) Logger {
 	}
 
 	return l
+}
+
+func NewWithOptions(options ...LoggerOption) Logger {
+	cfg := buildCfgFromOptions(options...)
+	return New(*cfg)
+}
+
+func buildCfgFromOptions(options ...LoggerOption) *LoggerConfig {
+	cfg := &LoggerConfig{
+		Level: defaultLevel(),
+	}
+	for _, opt := range options {
+		opt(cfg)
+	}
+
+	return cfg
 }
 
 func (l *loggerImpl) asyncWorker() {
